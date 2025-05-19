@@ -3,6 +3,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import matplotlib.dates as mdates
+import locale
 
 from modelo_forecasting import (
     cargar_datos_aforos,
@@ -218,40 +220,92 @@ app_ui = ui.page_fluid(
 
 
 def server(input, output, session):
-    # ------------- datos filtrados por rango -------------
+# ---------- 1. Datos filtrados por rango -----------------
     @reactive.Calc
     def datos_filtrados_por_rango():
-        """Filtra el dataframe según el rango de años seleccionado"""
+        """Filtra el dataframe según el rango de años seleccionado."""
         anio_min, anio_max = input.anio_range()
-        return df[(df["FECHA"].dt.year >= anio_min) & (df["FECHA"].dt.year <= anio_max)]
-    
-    # ------------- datos seleccionados -------------
+        return df.query("@anio_min <= FECHA.dt.year <= @anio_max")
+
+    # ---------- 2. Datos seleccionados (año–mes puntual) -----
     @reactive.Calc
     def datos_seleccionados():
-        """Filtra por año y mes específicos dentro del rango general"""
+        """Filtra un mes y año concretos dentro del rango general."""
         df_rango = datos_filtrados_por_rango()
-        tipos = obtener_tipos_seleccionados(input)
-        mes = int(input.mes() or "1")
-        anio = int(input.anio() or "2021")
-        return df_rango[
-            (df_rango["FECHA"].dt.year == anio) & 
-            (df_rango["FECHA"].dt.month == mes)
-        ][["FECHA"] + tipos]
+        tipos     = obtener_tipos_seleccionados(input)
+        mes       = int(input.mes()  or 1)
+        anio      = int(input.anio() or 2021)
 
-    # ------------------- tabla ----------------------
+        return (
+            df_rango
+            .loc[lambda d: (d.FECHA.dt.year == anio) & (d.FECHA.dt.month == mes),
+             ["FECHA", *tipos]]
+            .reset_index(drop=True)
+        )
+
+   # ---------- 3. Tabla con histórico + predicción puntual ----------
     @output
     @render.table
     def tabla():
         df_rango = datos_filtrados_por_rango()
-        mes = int(input.mes() or "1")
-        df_filtrado = df_rango[df_rango["FECHA"].dt.month == mes].copy()
-        df_filtrado["Año"] = df_filtrado["FECHA"].dt.year
-        df_filtrado["Mes"] = df_filtrado["FECHA"].dt.month.apply(lambda m: MESES_NOMBRE[m - 1])
-        cols = ["Año", "Mes"] + obtener_tipos_seleccionados(input)
-        df_formatted = df_filtrado[cols].copy()
-        for col in cols[2:]:
-            df_formatted[col] = df_formatted[col].apply(lambda x: f"{int(x):,}")
-        return df_formatted
+        tipos    = obtener_tipos_seleccionados(input)
+
+        mes_sel  = int(input.mes()  or 1)        # mes solicitado (1-12)
+        anio_sel = int(input.anio() or 2025)     # año solicitado
+
+        #Histórico mensual 
+        hist_mensual = (
+            df_rango
+            .loc[lambda d: d.FECHA.dt.month == mes_sel]
+            .assign(
+            Año = lambda d: d.FECHA.dt.year,
+            Mes = lambda d: d.FECHA.dt.month.map(lambda m: MESES_NOMBRE[m-1])
+            )
+            .groupby(["Año", "Mes"], as_index=False)[tipos]
+            .sum()
+        )
+
+        
+        #   Último dato real disponible para ese mes
+        if not hist_mensual.empty:
+            anio_ultimo = hist_mensual["Año"].max()
+        else:
+            anio_ultimo = df_rango["FECHA"].dt.year.max()   # por si no hay ningún año de ese mes
+
+        # Meses de diferencia entre último dato real y objetivo
+        horizon = (anio_sel - anio_ultimo)
+
+        if horizon >= 1:
+            # Avanzar 'horizon' años * 12 + 0 meses (mismo mes)
+            h_meses = horizon * 12
+
+            fila_pred = {
+            "Año": anio_sel,
+            "Mes": MESES_NOMBRE[mes_sel-1] + " (Pred)"
+            }
+            for t in tipos:
+                fila_pred[t] = predecir_valor(t, h_meses)["prediccion"]
+
+            hist_mensual = pd.concat(
+                [hist_mensual, pd.DataFrame([fila_pred])],
+                ignore_index=True
+            )
+
+        # ---- c) Orden y formato ----------------------------
+        orden_mes = {m: i for i, m in enumerate(MESES_NOMBRE)}
+        hist_mensual["ordinal_mes"] = hist_mensual["Mes"].str[:3].map(orden_mes)
+        hist_mensual = (
+            hist_mensual
+            .sort_values(["Año", "ordinal_mes"])
+            .drop(columns="ordinal_mes")
+        )
+
+        for col in tipos:
+            hist_mensual[col] = hist_mensual[col].apply(lambda x: f"{x:,.0f}")
+
+        return hist_mensual[["Año", "Mes", *tipos]]
+
+
 
     # ------------------- gráficos -------------------
     @output
@@ -290,51 +344,84 @@ def server(input, output, session):
     @output
     @render.plot
     def grafico_prediccion():
-        df_rango = datos_filtrados_por_rango()
-        tipo = input.tipo() or "AUTOS"
-        meses = input.meses_forecast() or 1
-        
-        # Usamos los datos filtrados para la serie histórica
-        serie_hist = df_rango.set_index("FECHA")[tipo].resample("MS").sum()
+        # --- 1. Parámetros de entrada ------------------------------------------
+        df_rango   = datos_filtrados_por_rango()
+        tipo       = (input.tipo()            or "AUTOS").upper()
+        meses      = int(input.meses_forecast() or 1)
 
-        predicciones = []
-        intervalos_inf = []
-        intervalos_sup = []
+        # --- 2. Serie histórica -------------------------------------------------
+        serie_hist = (
+           df_rango
+           .set_index("FECHA")[tipo]
+           .resample("MS")
+           .sum()
+        )
 
-        for i in range(1, meses + 1):
-        # Predecir para cada horizonte de tiempo
-            pred = predecir_valor(tipo, i)
-            predicciones.append(pred["prediccion"])
-            intervalos_inf.append(pred["inferior"])
-            intervalos_sup.append(pred["superior"])
+        # --- 3. Pronóstico ------------------------------------------------------
+        preds, infs, sups = [], [], []
+        for h in range(1, meses + 1):
+            out = predecir_valor(tipo, h)          # <- tu función Prophet
+            preds.append(out["prediccion"])
+            infs.append(out["inferior"])
+            sups.append(out["superior"])
 
-        # Generar fechas futuras
-        fechas_pred = pd.date_range(start=serie_hist.index[-1] + pd.DateOffset(months=1), periods=meses, freq="MS")
-       
-        
-        fig, ax = plt.subplots(figsize=(14, 8))
-        ax.plot(serie_hist.index, serie_hist.values, "-o", label="Histórico", markersize=4)
-        ax.plot(fechas_pred, predicciones, "r--o", label="Pronóstico", markersize=5)
-        ax.fill_between(fechas_pred, intervalos_inf, intervalos_sup, color='red', alpha=0.2, 
-                    label="Intervalo de confianza")
-        
-        ax.set_title(f"Pronóstico para {tipo}", fontsize=16)
-        ax.grid(True, linestyle="--", alpha=0.3)
-        
-        # Añadir etiquetas a los ejes
-        ax.set_xlabel("Fecha", fontsize=12)
-        ax.set_ylabel("Cantidad de vehículos", fontsize=12)
-        
-        # Formatear números grandes en eje Y
-        ax.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{int(x):,}"))
-        
-        # Añadir leyenda con mejor formato
-        ax.legend(fontsize=12, loc='best')
-        
-        # Formato de fecha para el eje x
-        plt.gcf().autofmt_xdate()
-        plt.tight_layout()
+        fechas_pred  = pd.date_range(
+            start=serie_hist.index[-1] + pd.DateOffset(months=1),
+            periods=meses,
+            freq="MS",
+        )
+
+        # --- 4. Gráfico ---------------------------------------------------------
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        # Serie histórica
+        ax.plot(
+            serie_hist.index,
+            serie_hist.values,
+            "-o",
+            label="Histórico",
+            markersize=4,
+        )
+
+        # Pronóstico
+        ax.plot(
+            fechas_pred,
+            preds,
+            "--o",
+            color="tab:red",
+            label="Pronóstico",
+            markersize=5,
+        )
+        ax.fill_between(
+            fechas_pred,
+            infs,
+            sups,
+            color="tab:red",
+            alpha=0.18,
+            label="Intervalo de confianza",
+        )
+
+        # --- 5. Formato de ejes -------------------------------------------------
+        ax.set_title(f"Pronóstico mensual para {tipo}", fontsize=15, pad=15)
+        ax.set_xlabel("Fecha", fontsize=11)
+        ax.set_ylabel("Cantidad de vehículos", fontsize=11)
+        ax.grid(ls="--", alpha=0.3)
+
+        # Fechas legibles cada 3 meses
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        fig.autofmt_xdate()
+
+        # Formato de miles en el eje Y
+        ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+        )
+
+        ax.legend(fontsize=10, frameon=False)
+        fig.tight_layout()
+
         return fig
+
 
     @output
     @render.plot
